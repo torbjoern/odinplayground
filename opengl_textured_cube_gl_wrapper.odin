@@ -5,6 +5,7 @@ import "vendor:glfw"
 import gl "vendor:OpenGL"
 import linalg "core:math/linalg"
 import glsl "core:math/linalg/glsl"
+import Wrapper "opengl_wrapper"
 
 WIDTH  	:: 640
 HEIGHT 	:: 480
@@ -14,12 +15,12 @@ TITLE 	:: "OpenGL with Odin"
 GL_MAJOR_VERSION :: 3
 GL_MINOR_VERSION :: 3
 
-program :u32= 0
 time:f64 = 0
-draw_elements :i32= 0
 texHandle:u32 = 0
 
 main :: proc() {
+    using glsl
+
 	if !bool(glfw.Init()) {
 		fmt.eprintln("GLFW has failed to load.")
 		return
@@ -39,22 +40,38 @@ main :: proc() {
 	// Load OpenGL function pointers with the specficed OpenGL major and minor version.
 	gl.load_up_to(GL_MAJOR_VERSION, GL_MINOR_VERSION, glfw.gl_set_proc_address)
 
-    if !setup_shaders() {
-        fmt.eprintln("failed to setup shaders")
+    program, ok := setup_shaders()
+    if !ok {
+        msg, shader_type := gl.get_last_error_message()
+        fmt.printf("Shader program creation error! %s %v\n", msg, shader_type )
         return
     }
-    err := gl.GetError()
-    if (err != gl.NO_ERROR)
+    Wrapper.CheckAttributes(program)
+
+    if err := gl.GetError(); err != gl.NO_ERROR
     {
         fmt.eprintln("gl error", err)
         return 
     }
-    setup_frame()
+    
+    cube := Wrapper.createCube()
+    sphere := Wrapper.createSphere()
+
+    sphere2 := Wrapper.MeshCreate( sphere.vbo )
+    sphere2.triangles = sphere.triangles
+
+    defer Wrapper.MeshDelete(&cube)
+    defer Wrapper.MeshDelete(&sphere)
+    defer gl.DeleteProgram(program)
+    meshList:[dynamic]^Wrapper.Mesh_t
+    append(&meshList, &cube)
+    append(&meshList, &sphere)
+    append(&meshList, &sphere2)
 
     texHandle = setup_texture()
+    defer gl.DeleteTextures(1, &texHandle)
 
-    err = gl.GetError()
-    if (err != gl.NO_ERROR)
+    if err := gl.GetError(); err != gl.NO_ERROR
     {
         fmt.eprintln("After setup gl error", err)
     }    
@@ -63,6 +80,9 @@ main :: proc() {
     nframes := 0
     seconds :f64= 0.0
     found_error := false
+
+    sphere2_position:vec3 = vec3{-1.5,1,4}
+    sphere2_vel:vec3 = vec3{10,10,10}
 
 	for !glfw.WindowShouldClose(window_handle) {
 		// Process all incoming events like keyboard press, window resize, and etc.
@@ -78,9 +98,30 @@ main :: proc() {
             nframes = 0
         }
 
-        render_frame()
-        err := gl.GetError()
-        if (err != gl.NO_ERROR && !found_error)
+        cube.worldTransform = 
+          mat4Translate(vec3{1.5,0,0}) * 
+          mat4Rotate( vec3{0,1,1}, radians_f32( 90.0 * f32(time) ) )
+        
+        sphere.worldTransform = 
+           mat4Translate(vec3{-1.5,0,0}) * 
+           mat4Rotate( vec3{1,1,0}, radians_f32( 90.0 * f32(time) ) )
+
+        sphere2_position += f32(dt) * sphere2_vel
+        if sphere2_position.x < -5 do sphere2_vel.x *= -1
+        if sphere2_position.y < -5 do sphere2_vel.y *= -1
+        if sphere2_position.z < -5 do sphere2_vel.z *= -1
+
+        if sphere2_position.x > 5 do sphere2_vel.x *= -1
+        if sphere2_position.y > 5 do sphere2_vel.y *= -1
+        if sphere2_position.z > 5 do sphere2_vel.z *= -1
+
+        sphere2.worldTransform = 
+           mat4Translate( sphere2_position ) * 
+           mat4Rotate( vec3{1,1,1}, radians_f32( 180.0 * f32(time) ) )
+
+        render_frame(program, meshList)
+        
+        if err := gl.GetError(); err != gl.NO_ERROR && !found_error
         {
             found_error = true
             fmt.eprintln("GLerror %d", err)
@@ -91,7 +132,7 @@ main :: proc() {
 	}
 }
 
-setup_shaders::proc() -> bool {
+setup_shaders::proc() -> (u32, bool) {
 vs_source :: `
     #version 330 core
     layout(location = 0) in vec3 vertexPosition;
@@ -139,7 +180,7 @@ fs_source :: `
         float spec = max(0.0,dot(reflect(light_dir,norm),normalize(p.xyz)));
         spec = pow(spec, 16.0)*.25;
         //vec4 debug = vec4(vec3(0.5)+.5*norm, 1.0);
-        FragColor = base/**vs_color*/*diffuse + spec*vec4(1.0); 
+        FragColor = .1*vs_color + base/**vs_color*/*diffuse + spec*vec4(1.0); 
     }
     void main()
     {
@@ -148,14 +189,7 @@ fs_source :: `
         //FragColor = .7*base + (.3*vs_color) + .01*t.x + .01*n.x;
     }`    
     // shaders
-    prog_handle, ok := gl.load_shaders_source(vs_source, fs_source) 
-    program = prog_handle
-    if !ok {
-        msg, shader_type := gl.get_last_error_message()
-        fmt.printf("Shader program creation error! %s %v\n", msg, shader_type )
-        return false
-    }
-    return true
+    return gl.load_shaders_source(vs_source, fs_source)
 }
 
 setup_texture::proc(/*const char *filename*/) -> u32 {
@@ -205,124 +239,7 @@ setup_texture::proc(/*const char *filename*/) -> u32 {
     return texture
 }
 
-setup_frame::proc() {
-    // Setup A struct so its more convenient to type the array literals
-    vec2::struct {
-        x:f32, y:f32,
-    }
-    vec3::struct {
-        x:f32, y:f32, z:f32,
-    }
-    vertex_format_t::struct {
-        position:vec3,
-        normal:vec3,
-        color:vec3,
-        texcoord:vec2,
-    }
-    assert( size_of(vec2) == 2*4 )
-    assert( size_of(vec3) == 3*4 )
-    assert( size_of(vertex_format_t) == 44 )
-    assert( offset_of(vertex_format_t, position) == 0 )
-    assert( offset_of(vertex_format_t, normal) == 3*size_of(f32) )
-    assert( offset_of(vertex_format_t, color) == (2*3*size_of(f32)) )
-    assert( offset_of(vertex_format_t, texcoord) == (3*3*size_of(f32)) )
-
-    cube_vertices := [8]vec3 {
-        vec3{-1, -1, -1},
-        vec3{1, -1, -1},
-        vec3{1, 1, -1},
-        vec3{-1, 1, -1},
-        vec3{-1, -1, 1},
-        vec3{1, -1, 1},
-        vec3{1, 1, 1},
-        vec3{-1, 1, 1},
-    }
-    cube_texcoords := [4]vec2 {
-        vec2{0,0},
-        vec2{1,0},
-        vec2{1,1},
-        vec2{0,1},
-    }
-    cube_normals := [6]vec3 {
-        vec3{0,0,1},
-        vec3{1,0,0},
-        vec3{0,0,-1},
-        vec3{-1,0,0},
-        vec3{0,1,0},
-        vec3{0,-1,0},
-    }
-    cube_colors := [6]vec3 {
-        vec3{1,0,0},
-        vec3{0,1,0},
-        vec3{0,0,1},
-        vec3{1,1,0},
-        vec3{1,0,1},
-        vec3{0,1,1},
-    }
-        
-    texInds := [6]u16 { 0, 1, 3, 3, 1, 2 }
-
-    cube_indices := [6 * 6] u16  {
-        0, 1, 3, 3, 1, 2,
-        1, 5, 2, 2, 5, 6,
-        5, 4, 6, 6, 4, 7,
-        4, 0, 7, 7, 0, 3,
-        3, 2, 7, 7, 2, 6,
-        4, 5, 0, 0, 5, 1,
-    }
-
-    vertexBuffer : [36]vertex_format_t = {}
-    assert( 36*size_of(vertex_format_t) == size_of(vertexBuffer) )
-    draw_elements = 36
-
-    for i:=0; i<36; i+=1 
-    {
-        vertexBuffer[i].position = cube_vertices[ cube_indices[i] ]
-        face := i/6
-        vertexBuffer[i].normal = cube_normals[face]
-        vertexBuffer[i].color = cube_colors[face]
-        vertexBuffer[i].texcoord = cube_texcoords[ texInds[i%6] ]
-    }
-    // Swap winding, 0,1,2 -> 0,2,1
-    for i:=0; i<36; i+=3 
-    {
-        vertexBuffer[i+0], vertexBuffer[i+2] = vertexBuffer[i+2], vertexBuffer[i+0] 
-    }
-
-    vbo :u32
-    gl.GenBuffers(1, &vbo)
-    gl.BindBuffer(gl.ARRAY_BUFFER, vbo)
-    gl.BufferData(gl.ARRAY_BUFFER, size_of(vertexBuffer), &vertexBuffer, gl.STATIC_DRAW)
-
-    attributeMap := map[cstring]int{
-        "vertexPosition" = 0,
-        "vertexNormal" = 0,
-        "vertexColor" = 0,
-        "vertexTexcoord" = 0}
-    for k,v in attributeMap {
-        loc := gl.GetAttribLocation(program, k)
-        if loc == -1 do fmt.println("Attribute", k, " doesnt exist or has been optimized away, loc:", loc)
-    }
-    
-    gl.EnableVertexAttribArray(0)
-    gl.VertexAttribPointer(0, 3, gl.FLOAT, false, size_of(vertex_format_t), cast(uintptr)0 )//offset_of(vertex_format_t, position) ) 
-
-    gl.EnableVertexAttribArray(1)
-    gl.VertexAttribPointer(1, 3, gl.FLOAT, false, size_of(vertex_format_t),  cast(uintptr)offset_of(vertex_format_t, normal)) 
-
-    gl.EnableVertexAttribArray(2)
-    gl.VertexAttribPointer(2, 3, gl.FLOAT, false, size_of(vertex_format_t),  cast(uintptr)offset_of(vertex_format_t, color))
-
-    gl.EnableVertexAttribArray(3)
-    gl.VertexAttribPointer(3, 2, gl.FLOAT, false, size_of(vertex_format_t),  cast(uintptr)offset_of(vertex_format_t, texcoord) )
-
-    //ibo:u32
-    //gl.GenBuffers(1, &ibo)
-    //gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
-    //gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, size_of(cube_indices), &cube_indices[0], gl.STATIC_DRAW);
-}
-
-render_frame::proc() {
+render_frame::proc( program:u32, meshPointerList:[dynamic]^Wrapper.Mesh_t ) {
     using glsl
     gl.Viewport(0, 0, WIDTH, HEIGHT);
     //gl.FrontFace(gl.CW) // CCW is default
@@ -345,23 +262,13 @@ render_frame::proc() {
         vec3{0,1,0},  // Head is up (set to 0,-1,0 to look upside-down)
     )
 
-    // Model matrix : an identity matrix (model will be at the origin)
-    Model:mat4 = mat4(1.0)
-    Model = mat4Rotate( vec3{1,1,0}, radians_f32( 90.0 * f32(time) ) )
-    mv:mat4 = View * Model
-    mvp:mat4 = Projection * View * Model; // Remember, matrix multiplication is the other way around
-    normalMtx := transpose( inverse( mat3(Model) ) )
     // Get a handle for our "MVP" uniform
-    // Only during the initialisation
-    uMV := gl.GetUniformLocation(program, "MV");
-    uMVP := gl.GetUniformLocation(program, "MVP");
-    uNormalMtx := gl.GetUniformLocation(program, "normalMatrix");
+    // Only needed during the initialisation
+    uMV := gl.GetUniformLocation(program, "MV")
+    uMVP := gl.GetUniformLocation(program, "MVP")
+    uNormalMtx := gl.GetUniformLocation(program, "normalMatrix")
     // Send our transformation to the currently bound shader, in the "MVP" uniform
     // This is done in the main loop since each model will have a different MVP matrix (At least for the M part)
-    gl.EnableVertexAttribArray(0)    
-    gl.EnableVertexAttribArray(1)
-    gl.EnableVertexAttribArray(2)
-    gl.EnableVertexAttribArray(3)
     gl.UseProgram(program)
 
     gl.ActiveTexture(gl.TEXTURE0);
@@ -369,9 +276,19 @@ render_frame::proc() {
     samplerID := gl.GetUniformLocation(program, "tex0");
     gl.Uniform1i(samplerID, 0);
 
-    gl.UniformMatrix4fv(uMV, 1, gl.FALSE, &mv[0][0]);
-    gl.UniformMatrix4fv(uMVP, 1, gl.FALSE, &mvp[0][0]);
-    gl.UniformMatrix3fv(uNormalMtx, 1, gl.FALSE, &normalMtx[0][0]);
-    //gl.DrawElements(gl.TRIANGLES, draw_elements, gl.UNSIGNED_SHORT, nil);
-    gl.DrawArrays(gl.TRIANGLES, 0, 36)
+    count := 0
+    for meshptr in meshPointerList {
+        mesh := meshptr^
+
+        Model:mat4 = mesh.worldTransform
+        mv:mat4 = View * Model
+        mvp:mat4 = Projection * View * Model; // Remember, matrix multiplication is the other way around
+        normalMtx := transpose( inverse( mat3(Model) ) )
+
+        gl.UniformMatrix4fv(uMV, 1, gl.FALSE, &mv[0][0]);
+        gl.UniformMatrix4fv(uMVP, 1, gl.FALSE, &mvp[0][0]);
+        gl.UniformMatrix3fv(uNormalMtx, 1, gl.FALSE, &normalMtx[0][0]);
+    
+        Wrapper.MeshDraw( meshptr, program )
+    }
 }
